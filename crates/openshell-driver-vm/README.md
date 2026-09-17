@@ -154,8 +154,8 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
 | `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Defaults to the sandbox image when unset. |
-| `vcpus` | `2` | vCPUs per sandbox. |
-| `mem_mib` | `2048` | Memory per sandbox, in MiB. |
+| `vcpus` | `2` | Default vCPUs per sandbox. Per-sandbox `--cpu` overrides this and rounds millicores up to whole vCPUs. |
+| `mem_mib` | `2048` | Default memory per sandbox, in MiB. Per-sandbox `--memory` overrides this and rounds up to MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
 | `krun_log_level` | `1` | libkrun verbosity (0-5). |
 | `guest_tls_ca` | unset | Historical key name for the host supervisor's gateway CA certificate. Required when `grpc_endpoint` uses `https://`; never copied into the guest. |

@@ -91,8 +91,10 @@ the gateway uid can access it.
 
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
 Docker and Podman apply them as runtime limits. Kubernetes applies them as both
-container requests and limits. The VM driver accepts the fields but currently
-ignores them.
+container requests and limits. The VM driver applies them as the microVM vCPU
+count and memory size, rounding millicores up to whole vCPUs and memory up to
+MiB. VM sandboxes reject resource requests. When omitted, the VM uses
+`[openshell.drivers.vm]` `vcpus` and `mem_mib`.
 
 Sandbox create also accepts experimental driver-owned config through
 `--driver-config-json`. The value is a JSON object keyed by driver name. The
@@ -377,6 +379,17 @@ network syscalls inside the guest and carries mediated streams over virtio-vsock
 to the host `openshell-supervisor`, which owns DNS, policy evaluation, and
 external connections. The driver does not create TAP interfaces or host
 nftables rules.
+
+Size each VM for a whole user session, not a single tool call. Stop and start
+the same sandbox across that user's work. The
+[MIND VM isolation example](https://github.com/NVIDIA/OpenShell/blob/main/examples/mind-vm-isolation)
+shows a default-deny policy that admits only host-loopback NATS and SWITCH for a
+Magentic MIND guest.
+
+On multi-tenant hosts, disable Kernel Samepage Merging, disable swap for guest
+memory, and either disable SMT or use core scheduling so distinct trust domains
+do not share sibling threads. Production isolation is Linux KVM. macOS
+Hypervisor.framework is a development path.
 
 ### Corporate Proxy Egress
 

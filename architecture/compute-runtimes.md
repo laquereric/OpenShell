@@ -273,8 +273,11 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
-Kubernetes mirrors each limit into the matching request. VM accepts the fields
-but currently ignores them.
+Kubernetes mirrors each limit into the matching request. VM applies CPU and
+memory limits as the microVM vCPU count and memory size. CPU millicores round
+up to whole vCPUs. Memory quantities round up to MiB. Resource requests are
+rejected; a dedicated VM has no shared-request model. `[openshell.drivers.vm]`
+`vcpus` and `mem_mib` remain the defaults when a sandbox omits limits.
 
 Reusable sandbox workload templates are resolved before the compute-driver
 boundary. Drivers do not receive a separate template resource; the gateway

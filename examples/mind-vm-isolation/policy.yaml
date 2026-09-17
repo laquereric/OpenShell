@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Per-user Magentic MIND sandbox. Default-deny except NATS (CPCP) and SWITCH
+# (completions). Vault keys, GRAPH, Milvus, and the public internet stay out.
+#
+# MIND uses native Python sockets (urllib, NATS client), not HTTP_PROXY, so
+# both admitted destinations are protocol: tcp. Publish NATS and SWITCH on
+# gateway-host loopback; the supervisor normalizes host.openshell.internal to
+# 127.0.0.1. Do not put provider credentials in the guest.
+#
+# Landlock is a hard requirement. Only list paths that exist in the MIND
+# image. Durable sqlite lives under /sandbox (the driver workdir), not a
+# /mind-data mount that is absent from distroless.
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /etc]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: hard_requirement
+
+network_policies:
+  nats:
+    name: mind-nats-cpcp
+    endpoints:
+      - host: host.openshell.internal
+        port: 4222
+        protocol: tcp
+    binaries:
+      - { path: /usr/bin/python3.13 }
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python }
+  switch:
+    name: mind-switch-completions
+    endpoints:
+      - host: host.openshell.internal
+        port: 8789
+        protocol: tcp
+    binaries:
+      - { path: /usr/bin/python3.13 }
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python }

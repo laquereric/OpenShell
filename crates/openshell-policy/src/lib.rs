@@ -4305,6 +4305,36 @@ network_policies:
     }
 
     #[test]
+    fn mind_vm_isolation_example_policy_parses() {
+        let yaml = include_str!("../../../examples/mind-vm-isolation/policy.yaml");
+        let policy = parse_sandbox_policy(yaml).expect("MIND VM example policy must parse");
+        validate_sandbox_policy(&policy).expect("MIND VM example policy must validate");
+        assert!(policy.network_policies.contains_key("nats"));
+        assert!(policy.network_policies.contains_key("switch"));
+        let nats = &policy.network_policies["nats"].endpoints[0];
+        assert_eq!(nats.host, "host.openshell.internal");
+        assert_eq!(nats.port, 4222);
+        assert_eq!(nats.protocol, "tcp");
+        let switch = &policy.network_policies["switch"].endpoints[0];
+        assert_eq!(switch.host, "host.openshell.internal");
+        assert_eq!(switch.port, 8789);
+        assert_eq!(switch.protocol, "tcp");
+        let python = policy.network_policies["nats"]
+            .binaries
+            .iter()
+            .any(|binary| binary.path == "/usr/bin/python3.13");
+        assert!(python, "MIND policy must name the distroless Python binary");
+        let fs = policy.filesystem.as_ref().expect("filesystem policy");
+        assert!(fs.read_write.iter().any(|path| path == "/sandbox"));
+        assert!(
+            !fs.read_write
+                .iter()
+                .any(|path| path.starts_with("/mind-data")),
+            "Landlock must not require a /mind-data path that distroless images omit"
+        );
+    }
+
+    #[test]
     fn round_trip_preserves_wildcard_host() {
         let yaml = r#"
 version: 1

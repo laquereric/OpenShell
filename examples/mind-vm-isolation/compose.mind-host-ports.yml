@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Magentic compose overlay for an OpenShell-hosted MIND.
+#
+# This file only adds loopback publishes for NATS and SWITCH. It does not
+# declare `mind`: a merge that invented that service would create an empty
+# container. Keep MIND out of compose with `--scale mind=0` if the base file
+# still defines it.
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f /path/to/OpenShell/examples/mind-vm-isolation/compose.mind-host-ports.yml \
+#     up --scale mind=0
+#
+# Do not publish these ports on 0.0.0.0.
+
+services:
+  nats:
+    ports:
+      - "127.0.0.1:4222:4222"
+  switch:
+    ports:
+      - "127.0.0.1:8789:8789"

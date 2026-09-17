@@ -47,7 +47,7 @@ use openshell_core::proto::compute::v1::{
     CpuResourceCapabilities, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
     DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse,
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
+    DriverResourceRequirements, DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
     DriverSandboxTemplate as SandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
@@ -986,10 +986,10 @@ impl VmDriver {
             driver_reports_runtime_readiness: false,
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
-                    limit_supported: false,
+                    limit_supported: true,
                 }),
                 memory: Some(MemoryResourceCapabilities {
-                    limit_supported: false,
+                    limit_supported: true,
                 }),
                 gpu: Some(GpuResourceCapabilities {
                     default_selection_supported: self.config.gpu_enabled,
@@ -1344,14 +1344,19 @@ impl VmDriver {
 
         let needs_qemu = is_gpu;
 
-        let mut plan =
-            match self.build_vm_launch_plan(&sandbox.id, needs_qemu, is_gpu, gpu_bdf.clone()) {
-                Ok(plan) => plan,
-                Err(err) => {
-                    self.release_gpu(&sandbox.id);
-                    return Err(err);
-                }
-            };
+        let mut plan = match self.build_vm_launch_plan(
+            &sandbox.id,
+            needs_qemu,
+            is_gpu,
+            gpu_bdf.clone(),
+            sandbox_template_resources(&sandbox),
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.release_gpu(&sandbox.id);
+                return Err(err);
+            }
+        };
 
         if let Err(err) = self
             .lifecycle_extensions
@@ -1388,6 +1393,24 @@ impl VmDriver {
         if let Err(err) =
             self.resolve_launch_plan_backend(&sandbox.id, is_gpu, gpu_bdf.clone(), &mut plan)
         {
+            self.lifecycle_extensions
+                .after_launch_failed(
+                    &sandbox,
+                    &state_dir,
+                    LaunchAbortReason::BeforeLaunchHookFailed,
+                )
+                .await;
+            self.release_gpu(&sandbox.id);
+            return Err(err);
+        }
+
+        // GPU QEMU sizing may overwrite vCPU/memory after the initial plan.
+        // Re-apply sandbox limits so `--cpu` / `--memory` remain the tenant size.
+        if let Err(err) = apply_vm_resource_limits(
+            sandbox_template_resources(&sandbox),
+            &mut plan.vcpus,
+            &mut plan.mem_mib,
+        ) {
             self.lifecycle_extensions
                 .after_launch_failed(
                     &sandbox,
@@ -2464,12 +2487,16 @@ impl VmDriver {
         needs_qemu: bool,
         is_gpu: bool,
         gpu_bdf: Option<String>,
+        resources: Option<&DriverResourceRequirements>,
     ) -> Result<LaunchPlan, Status> {
         if !needs_qemu {
+            let mut vcpus = self.config.vcpus;
+            let mut mem_mib = self.config.mem_mib;
+            apply_vm_resource_limits(resources, &mut vcpus, &mut mem_mib)?;
             return Ok(LaunchPlan {
                 backend: VmBackend::Libkrun,
-                vcpus: self.config.vcpus,
-                mem_mib: self.config.mem_mib,
+                vcpus,
+                mem_mib,
                 required_backends: Vec::new(),
                 required_backend_features: Vec::new(),
                 kernel_profile: None,
@@ -2482,11 +2509,12 @@ impl VmDriver {
         }
 
         let vsock_cid = allocate_vsock_cid();
-        let (vcpus, mem_mib) = if is_gpu {
+        let (mut vcpus, mut mem_mib) = if is_gpu {
             (self.config.gpu_vcpus, self.config.gpu_mem_mib)
         } else {
             (self.config.vcpus, self.config.mem_mib)
         };
+        apply_vm_resource_limits(resources, &mut vcpus, &mut mem_mib)?;
 
         Ok(LaunchPlan {
             backend: VmBackend::Qemu,
@@ -4462,6 +4490,9 @@ fn validate_vm_sandbox_template(template: &SandboxTemplate) -> Result<(), Status
             "vm sandboxes do not support template.platform_config",
         ));
     }
+    let mut vcpus = DEFAULT_VCPUS;
+    let mut mem_mib = DEFAULT_MEM_MIB;
+    apply_vm_resource_limits(template.resources.as_ref(), &mut vcpus, &mut mem_mib)?;
     Ok(())
 }
 
@@ -6891,6 +6922,145 @@ fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
     ))
 }
 
+fn sandbox_template_resources(sandbox: &Sandbox) -> Option<&DriverResourceRequirements> {
+    sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| template.resources.as_ref())
+}
+
+#[allow(clippy::result_large_err)]
+fn apply_vm_resource_limits(
+    resources: Option<&DriverResourceRequirements>,
+    vcpus: &mut u8,
+    mem_mib: &mut u32,
+) -> Result<(), Status> {
+    let Some(resources) = resources else {
+        return Ok(());
+    };
+    if !resources.cpu_request.trim().is_empty() {
+        return Err(Status::failed_precondition(
+            "vm compute driver does not support resources.requests.cpu",
+        ));
+    }
+    if !resources.memory_request.trim().is_empty() {
+        return Err(Status::failed_precondition(
+            "vm compute driver does not support resources.requests.memory",
+        ));
+    }
+    if let Some(cpu) = parse_vm_cpu_limit(&resources.cpu_limit)? {
+        *vcpus = cpu;
+    }
+    if let Some(memory) = parse_vm_memory_limit_mib(&resources.memory_limit)? {
+        *mem_mib = memory;
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err, clippy::cast_possible_truncation)]
+fn parse_vm_cpu_limit(value: &str) -> Result<Option<u8>, Status> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let vcpus = if let Some(millicores) = value.strip_suffix('m') {
+        let millicores = millicores.parse::<i64>().map_err(|_| {
+            Status::failed_precondition(format!(
+                "invalid vm cpu_limit '{value}'; expected an integer or millicore quantity",
+            ))
+        })?;
+        if millicores <= 0 {
+            return Err(Status::failed_precondition(
+                "vm cpu_limit must be greater than zero",
+            ));
+        }
+        millicores.saturating_add(999) / 1000
+    } else {
+        let cores = value.parse::<f64>().map_err(|_| {
+            Status::failed_precondition(format!(
+                "invalid vm cpu_limit '{value}'; expected an integer or millicore quantity",
+            ))
+        })?;
+        if !cores.is_finite() || cores <= 0.0 {
+            return Err(Status::failed_precondition(
+                "vm cpu_limit must be greater than zero",
+            ));
+        }
+        cores.ceil() as i64
+    };
+
+    if vcpus > i64::from(u8::MAX) {
+        return Err(Status::failed_precondition(
+            "vm cpu_limit cannot exceed 255 vCPUs",
+        ));
+    }
+    Ok(Some(vcpus as u8))
+}
+
+#[allow(clippy::result_large_err, clippy::cast_possible_truncation)]
+fn parse_vm_memory_limit_mib(value: &str) -> Result<Option<u32>, Status> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let number_end = value
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(number_end);
+    let amount = number.parse::<f64>().map_err(|_| {
+        Status::failed_precondition(format!(
+            "invalid vm memory_limit '{value}'; expected a Kubernetes-style quantity",
+        ))
+    })?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err(Status::failed_precondition(
+            "vm memory_limit must be greater than zero",
+        ));
+    }
+
+    let multiplier = match suffix {
+        "" => 1_f64,
+        "Ki" => 1024_f64,
+        "Mi" => 1024_f64.powi(2),
+        "Gi" => 1024_f64.powi(3),
+        "Ti" => 1024_f64.powi(4),
+        "Pi" => 1024_f64.powi(5),
+        "Ei" => 1024_f64.powi(6),
+        "K" => 1000_f64,
+        "M" => 1000_f64.powi(2),
+        "G" => 1000_f64.powi(3),
+        "T" => 1000_f64.powi(4),
+        "P" => 1000_f64.powi(5),
+        "E" => 1000_f64.powi(6),
+        _ => {
+            return Err(Status::failed_precondition(format!(
+                "invalid vm memory_limit suffix '{suffix}'",
+            )));
+        }
+    };
+
+    let bytes = (amount * multiplier).round() as u64;
+    let mib = if bytes == 0 {
+        0
+    } else {
+        bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024)
+    };
+    if mib == 0 {
+        return Err(Status::failed_precondition(
+            "vm memory_limit must be at least 1Mi",
+        ));
+    }
+    if mib > u64::from(u32::MAX) {
+        return Err(Status::failed_precondition(
+            "vm memory_limit exceeds the maximum VM memory size",
+        ));
+    }
+    Ok(Some(mib as u32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7499,7 +7669,7 @@ mod tests {
             ..Default::default()
         };
         let mut plan = driver
-            .build_vm_launch_plan(&sandbox.id, false, false, None)
+            .build_vm_launch_plan(&sandbox.id, false, false, None, None)
             .unwrap();
         let provisioning = tracing::info_span!("vm.provision");
 
@@ -7995,9 +8165,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_vm_sandbox_accepts_template_resources_as_noop() {
-        use openshell_core::proto::compute::v1::DriverResourceRequirements;
-
+    fn validate_vm_sandbox_accepts_template_resource_limits() {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
@@ -8013,8 +8181,50 @@ mod tests {
             }),
             ..Default::default()
         };
-        validate_vm_sandbox(&sandbox, false)
-            .expect("template.resources should be accepted and ignored");
+        validate_vm_sandbox(&sandbox, false).expect("template.resources limits should be accepted");
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_cpu_requests() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    resources: Some(DriverResourceRequirements {
+                        cpu_request: "1".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_vm_sandbox(&sandbox, false).expect_err("cpu requests are unsupported");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("resources.requests.cpu"));
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_memory_requests() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    resources: Some(DriverResourceRequirements {
+                        memory_request: "1Gi".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err =
+            validate_vm_sandbox(&sandbox, false).expect_err("memory requests are unsupported");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("resources.requests.memory"));
     }
 
     #[test]
@@ -10165,7 +10375,7 @@ mod tests {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
 
         let plan = driver
-            .build_vm_launch_plan("sandbox-x", false, false, None)
+            .build_vm_launch_plan("sandbox-x", false, false, None, None)
             .expect("plan should build");
 
         assert_eq!(plan.backend, VmBackend::Libkrun);
@@ -10174,6 +10384,53 @@ mod tests {
         assert!(plan.vsock_cid.is_none());
         assert!(plan.gpu_bdf.is_none());
         assert!(plan.env.is_empty());
+    }
+
+    #[test]
+    fn launch_plan_applies_cpu_and_memory_limits() {
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let resources = DriverResourceRequirements {
+            cpu_limit: "3".to_string(),
+            memory_limit: "4Gi".to_string(),
+            ..Default::default()
+        };
+        let plan = driver
+            .build_vm_launch_plan("sandbox-sized", false, false, None, Some(&resources))
+            .expect("sized plan should build");
+        assert_eq!(plan.vcpus, 3);
+        assert_eq!(plan.mem_mib, 4096);
+    }
+
+    #[test]
+    fn launch_plan_ceils_millicores_to_whole_vcpus() {
+        let resources = DriverResourceRequirements {
+            cpu_limit: "1500m".to_string(),
+            memory_limit: "512Mi".to_string(),
+            ..Default::default()
+        };
+        let mut vcpus = 2;
+        let mut mem_mib = 2048;
+        apply_vm_resource_limits(Some(&resources), &mut vcpus, &mut mem_mib)
+            .expect("millicore limits should apply");
+        assert_eq!(vcpus, 2);
+        assert_eq!(mem_mib, 512);
+    }
+
+    #[test]
+    fn parse_vm_cpu_limit_supports_cores_and_millicores() {
+        assert_eq!(parse_vm_cpu_limit("250m").unwrap(), Some(1));
+        assert_eq!(parse_vm_cpu_limit("2").unwrap(), Some(2));
+        assert_eq!(parse_vm_cpu_limit("2.1").unwrap(), Some(3));
+        assert!(parse_vm_cpu_limit("0").is_err());
+        assert!(parse_vm_cpu_limit("256").is_err());
+    }
+
+    #[test]
+    fn parse_vm_memory_limit_supports_binary_quantities() {
+        assert_eq!(parse_vm_memory_limit_mib("512Mi").unwrap(), Some(512));
+        assert_eq!(parse_vm_memory_limit_mib("1G").unwrap(), Some(954));
+        assert!(parse_vm_memory_limit_mib("12XB").is_err());
+        assert!(parse_vm_memory_limit_mib("0").is_err());
     }
 
     #[test]
@@ -10187,7 +10444,13 @@ mod tests {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
 
         let plan = driver
-            .build_vm_launch_plan("sandbox-gpu", true, true, Some("0000:01:00.0".to_string()))
+            .build_vm_launch_plan(
+                "sandbox-gpu",
+                true,
+                true,
+                Some("0000:01:00.0".to_string()),
+                None,
+            )
             .expect("gpu plan should build");
 
         assert_eq!(plan.backend, VmBackend::Qemu);
@@ -10195,6 +10458,44 @@ mod tests {
         assert_eq!(plan.mem_mib, 16384);
         assert_eq!(plan.gpu_bdf.as_deref(), Some("0000:01:00.0"));
         assert!(plan.vsock_cid.is_some());
+    }
+
+    #[test]
+    fn gpu_launch_plan_keeps_sandbox_cpu_and_memory_limits() {
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        let resources = DriverResourceRequirements {
+            cpu_limit: "3".to_string(),
+            memory_limit: "4Gi".to_string(),
+            ..Default::default()
+        };
+        let mut plan = driver
+            .build_vm_launch_plan(
+                "sandbox-gpu-sized",
+                true,
+                true,
+                Some("0000:01:00.0".to_string()),
+                Some(&resources),
+            )
+            .expect("gpu plan should honor tenant limits");
+        assert_eq!(plan.vcpus, 3);
+        assert_eq!(plan.mem_mib, 4096);
+
+        driver
+            .resolve_launch_plan_backend(
+                "sandbox-gpu-sized",
+                true,
+                Some("0000:01:00.0".to_string()),
+                &mut plan,
+            )
+            .expect("qemu resolution should succeed");
+        assert_eq!(
+            plan.vcpus, 8,
+            "QEMU GPU sizing overwrites vCPUs; provision re-applies tenant limits"
+        );
+        apply_vm_resource_limits(Some(&resources), &mut plan.vcpus, &mut plan.mem_mib)
+            .expect("limits must win after GPU QEMU sizing");
+        assert_eq!(plan.vcpus, 3);
+        assert_eq!(plan.mem_mib, 4096);
     }
 
     #[test]
@@ -10232,7 +10533,7 @@ mod tests {
     fn backend_feature_requirements_select_qemu_launch_plan() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         let mut plan = driver
-            .build_vm_launch_plan("sandbox-vfio", false, false, None)
+            .build_vm_launch_plan("sandbox-vfio", false, false, None, None)
             .expect("base plan should build");
         plan.require_backend_feature(BackendFeature::PciPassthrough);
 
@@ -10248,7 +10549,7 @@ mod tests {
     fn explicit_backend_requirement_selects_qemu_launch_plan() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         let mut plan = driver
-            .build_vm_launch_plan("sandbox-qemu", false, false, None)
+            .build_vm_launch_plan("sandbox-qemu", false, false, None, None)
             .expect("base plan should build");
         plan.require_backend(VmBackend::Qemu);
 
@@ -10264,7 +10565,7 @@ mod tests {
     fn guest_init_dropin_feature_does_not_force_qemu() {
         let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         let mut plan = driver
-            .build_vm_launch_plan("sandbox-init", false, false, None)
+            .build_vm_launch_plan("sandbox-init", false, false, None, None)
             .expect("base plan should build");
         plan.require_backend_feature(BackendFeature::GuestInitDropins);
 
@@ -10570,7 +10871,7 @@ mod tests {
     fn qemu_launch_plan_uses_vsock_only_with_host_proxy() {
         let driver = test_driver_with_proxy("http://127.0.0.1:8080");
         let mut plan = driver
-            .build_vm_launch_plan("sandbox-proxy-vsock", true, true, None)
+            .build_vm_launch_plan("sandbox-proxy-vsock", true, true, None, None)
             .expect("gpu plan should build");
         driver
             .resolve_launch_plan_backend("sandbox-proxy-vsock", true, None, &mut plan)
@@ -10656,8 +10957,8 @@ mod tests {
     fn capabilities_report_static_resource_support() {
         let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         let resources = driver.capabilities().resource_capabilities.unwrap();
-        assert!(!resources.cpu.unwrap().limit_supported);
-        assert!(!resources.memory.unwrap().limit_supported);
+        assert!(resources.cpu.unwrap().limit_supported);
+        assert!(resources.memory.unwrap().limit_supported);
         let gpu = resources.gpu.unwrap();
         assert!(!gpu.default_selection_supported);
         assert!(!gpu.count_selection_supported);

@@ -917,6 +917,9 @@ grpc_endpoint    = "https://host.openshell.internal:17670"
 # Empty falls back to default_image.
 bootstrap_image  = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 krun_log_level   = 1
+# Defaults when a sandbox omits --cpu / --memory. Those flags override these
+# values: millicores round up to whole vCPUs, memory rounds up to MiB.
+# Resource requests are rejected.
 vcpus            = 2
 mem_mib          = 2048
 overlay_disk_mib = 4096
